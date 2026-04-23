@@ -1,463 +1,529 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <WebSocketsServer.h>
-#include <esp_timer.h>
+#include <math.h>
+#include "app_config.h"
+#include "ble_transport.h"
+#include "calibration_store.h"
+#include "hardware_io.h"
+#include "scheduler.h"
+#include "types.h"
 
-// ---------- Hardware configuration ----------
-const char* WIFI_SSID = "Tumhare Papa";
-const char* WIFI_PASSWORD = "mallyajitwifi";
-const uint8_t PHOTODIODE_PIN = 0;
-const uint8_t RED_LED_PIN = 3;
-const uint8_t IR_LED_PIN = 4;
+namespace hb {
+namespace {
 
-// ---------- Timing constants ----------
-const unsigned long SAMPLE_INTERVAL_US = 10000; // 100 Hz sampling
-const unsigned long LED_TOGGLE_INTERVAL_MS = 30; // alternate LEDs less often
-const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
-const uint8_t SEND_BATCH_SIZE = 8; // send ~12 Hz updates
+// ── Operating mode ──
+enum class OpMode : uint8_t { kIdle = 0, kHbBurst = 1, kPulse = 2 };
 
-// ---------- Networking ----------
-WebServer server(80);
-WebSocketsServer webSocket(81);
+HardwareIO gHardware;
+MeasurementScheduler gScheduler;
+CalibrationStore gCalibrationStore;
+BleTransport gBleTransport;
 
-// ---------- Web UI assets ----------
-const char INDEX_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>HemePulse Live</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-  <style>
-    :root {
-      --bg: #05060a;
-      --card: rgba(20, 29, 63, 0.85);
-      --accent: #f64e5b;
-      --accent-muted: #5ee1ab;
-      font-family: 'Space Grotesk', 'Segoe UI', system-ui, sans-serif;
-      color: #f8f9ff;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      background: linear-gradient(135deg, #0b1430 0%, #05060a 100%);
-      padding: 1.25rem;
-      display: flex;
-      justify-content: center;
-    }
-    main {
-      width: min(1100px, 100%);
-      display: grid;
-      gap: 1rem;
-    }
-    .panel {
-      background: var(--card);
-      border-radius: 1rem;
-      padding: 1.5rem;
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      box-shadow: 0 25px 60px rgba(0, 0, 0, 0.5);
-    }
-    .panel h1 {
-      margin: 0;
-      font-size: 1.6rem;
-    }
-    .status {
-      color: rgba(255, 255, 255, 0.7);
-      font-size: 0.85rem;
-    }
-    .chart-wrapper {
-      position: relative;
-      height: 360px;
-    }
-    .grid {
-      margin-top: 1rem;
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 0.75rem;
-    }
-    .metric {
-      background: rgba(255, 255, 255, 0.03);
-      border-radius: 0.9rem;
-      padding: 1rem;
-      border: 1px solid rgba(255, 255, 255, 0.06);
-    }
-    .metric h3 {
-      margin: 0;
-      font-size: 0.8rem;
-      text-transform: uppercase;
-      letter-spacing: 0.2rem;
-      color: rgba(255, 255, 255, 0.6);
-    }
-    .metric .value {
-      margin-top: 0.3rem;
-      font-size: 2.1rem;
-      font-weight: 600;
-      color: var(--accent);
-    }
-    .badge {
-      width: 36px;
-      height: 36px;
-      border-radius: 50%;
-      border: 2px solid rgba(255, 255, 255, 0.3);
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 600;
-      color: var(--accent);
-      transition: transform 0.2s ease;
-    }
-    .badge.active {
-      transform: scale(1.1);
-      border-color: var(--accent-muted);
-      color: var(--accent-muted);
-      box-shadow: 0 0 12px rgba(94, 225, 171, 0.6);
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <section class="panel">
-      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">
-        <h1>HemePulse Live</h1>
-        <div class="status">WebSocket: <span id="wsStatus">Connecting...</span></div>
-      </div>
-      <div class="chart-wrapper">
-        <canvas id="waveform"></canvas>
-      </div>
-      <div class="grid">
-        <div class="metric">
-          <h3>Voltage</h3>
-          <div class="value" id="voltage">0.000 V</div>
-          <p class="status">ADC voltage on GPIO0</p>
-        </div>
-        <div class="metric">
-          <h3>Raw ADC</h3>
-          <div class="value" id="adc">0</div>
-          <p class="status">12-bit sampling</p>
-        </div>
-        <div class="metric">
-          <h3>BPM</h3>
-          <div class="value" id="bpm">--</div>
-          <p class="status">Peak-to-peak intervals</p>
-        </div>
-        <div class="metric" style="display:flex;flex-direction:column;align-items:center;gap:0.25rem;">
-          <div>Peak</div>
-          <div class="badge" id="peak">▲</div>
-        </div>
-      </div>
-    </section>
-  </main>
+TelemetryPacket gLastPacket;
+bool gHasLastPacket = false;
+bool gConnectionSeen = false;
 
-  <script>
-    const ctx = document.getElementById('waveform').getContext('2d');
-    const MAX_POINTS = 150;
-    const VIEW_WINDOW_MS = 6000;
-    const CHART_FLUSH_MS = 300;
-    const pendingPoints = [];
-    const chart = new Chart(ctx, {
-      type: 'line',
-      data: {
-        datasets: [{
-          label: 'Photodiode',
-          borderColor: '#f64e5b',
-          borderWidth: 2,
-          pointRadius: 0,
-          tension: 0.2,
-          fill: false,
-          data: []
-        }]
-      },
-      options: {
-        animation: false,
-        responsive: true,
-        maintainAspectRatio: false,
-        scales: {
-          x: {
-            type: 'linear',
-            ticks: { callback: (value) => ((value / 1000) % 60).toFixed(1) + 's' },
-            title: { display: true, text: 'Time (s)' }
-          },
-          y: {
-            min: 0,
-            max: 3.3,
-            title: { display: true, text: 'Voltage (V)' }
+// Mode state
+OpMode gMode = OpMode::kIdle;
+uint32_t gLastHbSnapshotMs = 0;
+uint32_t gHbBurstStartMs = 0;
+uint32_t gPulseModeStartMs = 0;
+uint32_t gLastDebugMs = 0;
+uint32_t gLastWaveformMs = 0;
+
+// ── Realtime state (shared between burst and pulse) ──
+struct RealtimeState {
+  bool initialized = false;
+  float redAvg = 0.0f;
+  float irAvg = 0.0f;
+  float prevRatio = 0.0f;
+  uint8_t suspiciousStreak = 0;
+  uint8_t stableStreak = 0;
+  float irWindow[5] = {};
+  uint8_t irWindowCount = 0;
+  uint8_t irWindowIndex = 0;
+  float irFiltered = 0.0f;
+};
+
+struct BaselineCaptureState {
+  bool active = false;
+  uint32_t startMs = 0;
+  float sumRed = 0.0f;
+  float sumIr = 0.0f;
+  float sumRatio = 0.0f;
+  uint32_t sumConfidence = 0;
+  uint16_t count = 0;
+};
+
+struct SessionAccumulator {
+  uint32_t sampleCount = 0;
+  uint32_t goodSampleCount = 0;
+  uint32_t suspiciousSampleCount = 0;
+  uint32_t badSignalSampleCount = 0;
+  float sumRed = 0.0f;
+  float sumIr = 0.0f;
+  float sumRatio = 0.0f;
+  uint32_t sumConfidence = 0;
+};
+
+RealtimeState gRealtime;
+BaselineCaptureState gBaselineCapture;
+SessionAccumulator gSession;
+
+// Burst sample counter
+uint32_t gBurstSampleCount = 0;
+
+// ── Utility functions ──
+
+uint8_t clampU8(int value) {
+  if (value < 0) return 0;
+  if (value > 100) return 100;
+  return static_cast<uint8_t>(value);
+}
+
+int16_t quantizeSignal(float value) {
+  if (value < -32768.0f) return -32768;
+  if (value > 32767.0f) return 32767;
+  return static_cast<int16_t>(value >= 0.0f ? (value + 0.5f) : (value - 0.5f));
+}
+
+float safeRatio(float redValue, float irValue) {
+  if (irValue <= 1e-6f) return 0.0f;
+  const float ratio = redValue / irValue;
+  return isfinite(ratio) ? ratio : 0.0f;
+}
+
+bool isMotionLikely(const RawCycleSample& sample, float ratio) {
+  if (!gRealtime.initialized) return false;
+  const float redJump = fabsf(sample.redCorrected - gRealtime.redAvg) / fmaxf(1.0f, gRealtime.redAvg);
+  // In pulse mode, IR is off — only use RED jump for motion detection
+  if (gMode == OpMode::kPulse) {
+    return (redJump > config::kMotionSignalJumpThreshold);
+  }
+  const float irJump = fabsf(sample.irCorrected - gRealtime.irAvg) / fmaxf(1.0f, gRealtime.irAvg);
+  const float ratioJump = fabsf(ratio - gRealtime.prevRatio);
+  return (ratioJump > config::kMotionRatioJumpThreshold) ||
+         (redJump > config::kMotionSignalJumpThreshold) ||
+         (irJump > config::kMotionSignalJumpThreshold);
+}
+
+uint8_t computeSimpleConfidence(const RawCycleSample& sample, float redAvg, float irAvg,
+                               float ratio, bool motionLikely) {
+  int score = 100;
+  // In pulse mode, IR is intentionally off — skip IR penalties
+  if (gMode != OpMode::kPulse) {
+    if (irAvg < config::kMinIrSignal) score -= 35;
+    if (ratio <= 1e-6f) score -= 20;
+    const float ambientVsIr = static_cast<float>(sample.ambientRaw) / fmaxf(1.0f, static_cast<float>(sample.irRaw));
+    if (ambientVsIr > 0.88f) score -= 18;
+  }
+  if (redAvg < config::kMinRedSignal) score -= 22;
+  if (motionLikely) score -= 30;
+  return clampU8(score);
+}
+
+WarningState evaluateLocalWarning(float ratio, uint8_t confidence, bool motionLikely) {
+  const CalibrationProfile& profile = gCalibrationStore.profile();
+  const float baseline = profile.userBaselineR;
+  if (!profile.baselineValid || baseline <= 1e-6f) return WarningState::kBaselineNeeded;
+  if (confidence < config::kConfidencePoor || motionLikely) return WarningState::kLowSignal;
+  const float driftAbs = fabsf((ratio - baseline) / baseline);
+  if (driftAbs < config::kStableDriftThreshold) {
+    gRealtime.stableStreak = static_cast<uint8_t>(gRealtime.stableStreak + 1);
+    if (gRealtime.suspiciousStreak > 0) gRealtime.suspiciousStreak--;
+    return WarningState::kNormal;
+  }
+  gRealtime.stableStreak = 0;
+  gRealtime.suspiciousStreak = static_cast<uint8_t>(gRealtime.suspiciousStreak + 1);
+  if (driftAbs >= config::kHighDriftThreshold && gRealtime.suspiciousStreak >= config::kHighStreakThreshold)
+    return WarningState::kHigh;
+  if (driftAbs >= config::kElevatedDriftThreshold && gRealtime.suspiciousStreak >= config::kElevatedStreakThreshold)
+    return WarningState::kElevated;
+  return WarningState::kNormal;
+}
+
+uint8_t makeFlags(WarningState warning, uint8_t confidence, bool baselineValid,
+                  bool baselineCapturing, bool motionLikely) {
+  uint8_t flags = 0;
+  flags |= 0x02;
+  if (confidence < config::kConfidenceFair) flags |= 0x04;
+  if (warning == WarningState::kElevated || warning == WarningState::kHigh) flags |= 0x08;
+  if (baselineValid) flags |= 0x10;
+  if (baselineCapturing) flags |= 0x20;
+  if (motionLikely) flags |= 0x40;
+  return flags;
+}
+
+float updateFilteredIrPreview(float irValue) {
+  gRealtime.irWindow[gRealtime.irWindowIndex] = irValue;
+  gRealtime.irWindowIndex = static_cast<uint8_t>((gRealtime.irWindowIndex + 1U) % 5U);
+  if (gRealtime.irWindowCount < 5U) ++gRealtime.irWindowCount;
+  float movingAverage = 0.0f;
+  for (uint8_t i = 0; i < gRealtime.irWindowCount; ++i) movingAverage += gRealtime.irWindow[i];
+  movingAverage /= static_cast<float>(gRealtime.irWindowCount);
+  gRealtime.irFiltered = irValue - movingAverage;
+  return gRealtime.irFiltered;
+}
+
+void resetSessionAccumulator() { gSession = SessionAccumulator(); }
+
+void startBaselineCapture(uint32_t nowMs) {
+  gBaselineCapture.active = true;
+  gBaselineCapture.startMs = nowMs;
+  gBaselineCapture.sumRed = 0.0f;
+  gBaselineCapture.sumIr = 0.0f;
+  gBaselineCapture.sumRatio = 0.0f;
+  gBaselineCapture.sumConfidence = 0;
+  gBaselineCapture.count = 0;
+  gBleTransport.setBaselineCapturing(true);
+}
+
+void updateBaselineCapture(float redAvg, float irAvg, float ratio, uint8_t confidence, uint32_t nowMs) {
+  if (!gBaselineCapture.active) return;
+  if (ratio > 1e-6f && confidence >= config::kMinConfidenceForBaseline) {
+    gBaselineCapture.sumRed += redAvg;
+    gBaselineCapture.sumIr += irAvg;
+    gBaselineCapture.sumRatio += ratio;
+    gBaselineCapture.sumConfidence += confidence;
+    ++gBaselineCapture.count;
+  }
+  if ((nowMs - gBaselineCapture.startMs) < config::kBaselineCaptureDurationMs) return;
+  gBaselineCapture.active = false;
+  gBleTransport.setBaselineCapturing(false);
+  if (gBaselineCapture.count < config::kMinBaselineSamples) return;
+  const float invCount = 1.0f / static_cast<float>(gBaselineCapture.count);
+  gCalibrationStore.setTrustedBaseline(
+      gBaselineCapture.sumRed * invCount, gBaselineCapture.sumIr * invCount,
+      gBaselineCapture.sumRatio * invCount,
+      static_cast<uint8_t>(gBaselineCapture.sumConfidence / static_cast<uint32_t>(gBaselineCapture.count)), true);
+  gBleTransport.setBaselineValue(gBaselineCapture.sumRatio * invCount, true);
+}
+
+void updateSessionAccumulator(float redAvg, float irAvg, float ratio, uint8_t confidence,
+                              WarningState warning, bool motionLikely) {
+  ++gSession.sampleCount;
+  gSession.sumRed += redAvg;
+  gSession.sumIr += irAvg;
+  gSession.sumRatio += ratio;
+  gSession.sumConfidence += confidence;
+  if (confidence >= config::kConfidenceFair && !motionLikely) ++gSession.goodSampleCount;
+  if (warning == WarningState::kElevated || warning == WarningState::kHigh) ++gSession.suspiciousSampleCount;
+  if (warning == WarningState::kLowSignal || confidence < config::kConfidencePoor || motionLikely)
+    ++gSession.badSignalSampleCount;
+}
+
+void saveSessionSummary(uint32_t nowMs) {
+  SessionSummary summary;
+  summary.timestampMs = nowMs;
+  if (gSession.sampleCount > 0) {
+    const float invCount = 1.0f / static_cast<float>(gSession.sampleCount);
+    summary.avgRed = gSession.sumRed * invCount;
+    summary.avgIr = gSession.sumIr * invCount;
+    summary.ratioR = gSession.sumRatio * invCount;
+    summary.confidence = static_cast<uint8_t>(gSession.sumConfidence / static_cast<uint32_t>(gSession.sampleCount));
+  }
+  summary.bpm = 0;
+  summary.valid = gSession.sampleCount >= config::kMinSessionSamples;
+  if (!summary.valid || gSession.badSignalSampleCount > (gSession.sampleCount / 2)) summary.riskFlag = 2;
+  else if (gSession.suspiciousSampleCount * 3 > gSession.goodSampleCount) summary.riskFlag = 1;
+  else summary.riskFlag = 0;
+  uint16_t stableSessions = gCalibrationStore.profile().stableSessionCount;
+  uint16_t suspiciousSessions = gCalibrationStore.profile().suspiciousSessionCount;
+  uint16_t badSessions = gCalibrationStore.profile().badSignalSessionCount;
+  if (summary.riskFlag == 2) ++badSessions;
+  else if (summary.riskFlag == 1) ++suspiciousSessions;
+  else ++stableSessions;
+  gCalibrationStore.setSessionCounters(stableSessions, suspiciousSessions, badSessions);
+  gCalibrationStore.saveLastSessionSummary(summary);
+}
+
+// ── Process one measurement cycle and build/send packet ──
+bool processMeasurementCycle(uint32_t nowUs, bool publishBle) {
+  RawCycleSample sample;
+  if (!gScheduler.update(nowUs, sample)) return false;
+
+  if (!gRealtime.initialized) {
+    gRealtime.redAvg = sample.redCorrected;
+    gRealtime.irAvg = sample.irCorrected;
+    gRealtime.prevRatio = safeRatio(gRealtime.redAvg, gRealtime.irAvg);
+    gRealtime.initialized = true;
+  } else {
+    gRealtime.redAvg += config::kEmaAlpha * (sample.redCorrected - gRealtime.redAvg);
+    gRealtime.irAvg += config::kEmaAlpha * (sample.irCorrected - gRealtime.irAvg);
+  }
+
+  const float filteredIr = updateFilteredIrPreview(gRealtime.irAvg);
+  const float ratio = safeRatio(gRealtime.redAvg, gRealtime.irAvg);
+  const bool motionLikely = isMotionLikely(sample, ratio);
+  const uint8_t confidence = computeSimpleConfidence(sample, gRealtime.redAvg, gRealtime.irAvg, ratio, motionLikely);
+
+  updateBaselineCapture(gRealtime.redAvg, gRealtime.irAvg, ratio, confidence, sample.timestampMs);
+  const WarningState warning = evaluateLocalWarning(ratio, confidence, motionLikely);
+  const bool baselineValid = gCalibrationStore.profile().baselineValid;
+
+  TelemetryPacket packet;
+  packet.timestampMs = sample.timestampMs;
+  packet.ambientRaw = sample.ambientRaw;
+  packet.redCorrected = quantizeSignal(gRealtime.redAvg);
+  packet.irCorrected = quantizeSignal(gRealtime.irAvg);
+  packet.bpmHint = 0;
+  packet.bpm = 0;
+  packet.ratioR = ratio;
+  packet.confidence = confidence;
+  packet.warning = warning;
+  packet.flags = makeFlags(warning, confidence, baselineValid, gBaselineCapture.active, motionLikely);
+
+  gLastPacket = packet;
+  gHasLastPacket = true;
+
+  if (publishBle) {
+    gBleTransport.publish(packet, true);
+  }
+
+  updateSessionAccumulator(gRealtime.redAvg, gRealtime.irAvg, ratio, confidence, warning, motionLikely);
+  gRealtime.prevRatio = ratio;
+
+  // Waveform serial output (only when enabled, throttled)
+  if (config::kEnableSerialWaveform) {
+    const uint32_t nowMs = millis();
+    if ((nowMs - gLastWaveformMs) >= config::kWaveformPrintIntervalMs) {
+      gLastWaveformMs = nowMs;
+      Serial.print(">sin:");
+      Serial.println(filteredIr, 3);
+    }
+  }
+
+  return true;
+}
+
+// ── Mode transitions ──
+
+void enterPulseMode(uint32_t nowMs) {
+  gMode = OpMode::kPulse;
+  gPulseModeStartMs = nowMs;
+  gRealtime = RealtimeState();
+  // RED-only scheduler: only flash RED LED, skip IR
+  gScheduler.beginRedOnly(gHardware, micros());
+  if (config::kEnableSerialDebug) Serial.println("[MODE] Entering PULSE mode (RED-only)");
+}
+
+void enterIdleMode() {
+  gMode = OpMode::kIdle;
+  gScheduler.stop();
+  gHardware.allLedsOff();
+  if (config::kEnableSerialDebug) Serial.println("[MODE] Entering IDLE mode");
+}
+
+void enterHbBurst(uint32_t nowMs) {
+  gMode = OpMode::kHbBurst;
+  gHbBurstStartMs = nowMs;
+  gBurstSampleCount = 0;
+  gRealtime = RealtimeState();
+  gScheduler.begin(gHardware, micros());
+  if (config::kEnableSerialDebug) Serial.println("[HB] Starting measurement burst");
+}
+
+bool timeForHbSnapshot(uint32_t nowMs) {
+  return (nowMs - gLastHbSnapshotMs) >= config::kHbIntervalMs;
+}
+
+// ── Command handler ──
+void handleBleCommand(const BleCommand& command, uint32_t nowMs) {
+  switch (command.type) {
+    case CommandType::kRequestSnapshot:
+      if (gHasLastPacket) gBleTransport.publish(gLastPacket, true, true);
+      break;
+    case CommandType::kStartBaselineCapture:
+      startBaselineCapture(nowMs);
+      break;
+    case CommandType::kSetBaseline:
+      if (command.valueF32 > 1e-6f) {
+        const CalibrationProfile& profile = gCalibrationStore.profile();
+        gCalibrationStore.setTrustedBaseline(profile.baselineRedAvg, profile.baselineIrAvg,
+                                             command.valueF32, profile.baselineConfidence, true);
+        gBleTransport.setBaselineValue(command.valueF32, true);
+      }
+      break;
+    case CommandType::kClearBaseline:
+      gCalibrationStore.clearUserBaseline();
+      gBleTransport.setBaselineValue(0.0f, false);
+      break;
+    case CommandType::kSetPhotodiodeSensitivity:
+      gCalibrationStore.setPhotodiodeSensitivity(command.valueF32);
+      break;
+    case CommandType::kSetAmplifierGain:
+      gCalibrationStore.setAmplifierGain(command.valueF32);
+      break;
+    case CommandType::kSetBaselineVoltage:
+      gCalibrationStore.setBaselineVoltage(command.valueF32);
+      break;
+    case CommandType::kBpmStart:
+    case CommandType::kModePulse:
+      if (gMode != OpMode::kPulse) enterPulseMode(nowMs);
+      break;
+    case CommandType::kBpmStop:
+    case CommandType::kModeIdle:
+      if (gMode != OpMode::kIdle) enterIdleMode();
+      break;
+    default:
+      break;
+  }
+}
+
+// ── Debug printing (throttled) ──
+void printPeriodicDebug(uint32_t nowMs) {
+  if (!config::kEnableSerialDebug) return;
+  if ((nowMs - gLastDebugMs) < config::kDebugPrintIntervalMs) return;
+  gLastDebugMs = nowMs;
+  Serial.print("[DBG] mode=");
+  Serial.print(static_cast<uint8_t>(gMode));
+  Serial.print(" heap=");
+  Serial.print(ESP.getFreeHeap());
+  Serial.print(" conn=");
+  Serial.print(gBleTransport.isConnected() ? 1 : 0);
+  if (gHasLastPacket) {
+    Serial.print(" R=");
+    Serial.print(gLastPacket.ratioR, 4);
+    Serial.print(" conf=");
+    Serial.print(gLastPacket.confidence);
+    Serial.print(" red=");
+    Serial.print(gLastPacket.redCorrected);
+  }
+  Serial.println();
+}
+
+}  // namespace
+
+// ══════════════════════════════════════════════════
+// PUBLIC ENTRY POINTS
+// ══════════════════════════════════════════════════
+
+void appSetup() {
+  if (config::kEnableSerialDebug || config::kEnableSerialWaveform) {
+    Serial.begin(115200);
+    delay(25);
+  }
+
+  gHardware.begin();
+  gCalibrationStore.begin();
+
+  gBleTransport.begin(config::kBleDeviceName);
+  gBleTransport.setBaselineCapturing(false);
+  gBleTransport.setBaselineValue(gCalibrationStore.profile().userBaselineR,
+                                 gCalibrationStore.profile().baselineValid);
+
+  gRealtime = RealtimeState();
+  gBaselineCapture = BaselineCaptureState();
+  gLastWaveformMs = 0;
+  resetSessionAccumulator();
+
+  gConnectionSeen = gBleTransport.isConnected();
+
+  // Start in idle mode — LEDs off, scheduler stopped
+  gMode = OpMode::kIdle;
+  gLastHbSnapshotMs = millis() - config::kHbIntervalMs; // trigger first snapshot immediately
+
+  if (config::kEnableSerialDebug) {
+    Serial.println("[BOOT] HemePulse two-mode firmware started");
+    Serial.print("[BOOT] Hb interval=");
+    Serial.print(config::kHbIntervalMs);
+    Serial.print("ms, burst=");
+    Serial.print(config::kHbBurstMs);
+    Serial.print("ms, heap=");
+    Serial.println(ESP.getFreeHeap());
+  }
+}
+
+void appLoop() {
+  const uint32_t nowMs = millis();
+
+  // 1. Poll BLE (lightweight)
+  gBleTransport.update(nowMs);
+
+  // 2. Handle connection changes
+  const bool connectedNow = gBleTransport.isConnected();
+  if (connectedNow && !gConnectionSeen) {
+    gConnectionSeen = true;
+    if (gHasLastPacket) gBleTransport.publish(gLastPacket, true, true);
+  }
+  if (!connectedNow && gConnectionSeen) {
+    gConnectionSeen = false;
+    saveSessionSummary(nowMs);
+    resetSessionAccumulator();
+    // Exit pulse mode on disconnect
+    if (gMode == OpMode::kPulse) enterIdleMode();
+  }
+
+  // 3. Consume BLE commands
+  BleCommand command;
+  while (gBleTransport.popCommand(command)) {
+    handleBleCommand(command, nowMs);
+  }
+
+  // 4. Mode dispatch
+  switch (gMode) {
+    case OpMode::kIdle: {
+      // Check if it's time for a Hb snapshot
+      if (timeForHbSnapshot(nowMs)) {
+        enterHbBurst(nowMs);
+      } else {
+        // LOW POWER IDLE — yield CPU
+        delay(config::kIdleLoopDelayMs);
+      }
+      break;
+    }
+
+    case OpMode::kHbBurst: {
+      // Run measurement cycles for burst duration
+      const uint32_t elapsed = nowMs - gHbBurstStartMs;
+      if (elapsed < config::kHbBurstMs) {
+        // Only publish the LAST sample of the burst
+        bool isFinalSample = elapsed >= (config::kHbBurstMs - 25);
+        if (processMeasurementCycle(micros(), isFinalSample)) {
+          ++gBurstSampleCount;
+        }
+      } else {
+        // Burst complete — send final packet and return to idle
+        if (gHasLastPacket && gBleTransport.isConnected()) {
+          gBleTransport.publish(gLastPacket, true, true);
+        }
+        gLastHbSnapshotMs = nowMs;
+        if (config::kEnableSerialDebug) {
+          Serial.print("[HB] Burst complete, samples=");
+          Serial.print(gBurstSampleCount);
+          if (gHasLastPacket) {
+            Serial.print(" R=");
+            Serial.print(gLastPacket.ratioR, 4);
+            Serial.print(" conf=");
+            Serial.print(gLastPacket.confidence);
           }
-        },
-        plugins: { legend: { display: false } }
+          Serial.println();
+        }
+        enterIdleMode();
       }
-    });
+      break;
+    }
 
-    function flushChart() {
-      if (!pendingPoints.length) return;
-      pendingPoints.forEach((point) => chart.data.datasets[0].data.push(point));
-      pendingPoints.length = 0;
-      while (chart.data.datasets[0].data.length > MAX_POINTS) {
-        chart.data.datasets[0].data.shift();
+    case OpMode::kPulse: {
+      // Check timeout
+      if ((nowMs - gPulseModeStartMs) >= config::kPulseSessionMs) {
+        if (config::kEnableSerialDebug) Serial.println("[PULSE] Session timeout, returning to idle");
+        enterIdleMode();
+        break;
       }
-      const now = Date.now();
-      chart.options.scales.x.min = now - VIEW_WINDOW_MS;
-      chart.options.scales.x.max = now;
-      chart.update('none');
-    }
-
-    setInterval(flushChart, CHART_FLUSH_MS);
-
-    function enqueueVoltage(voltage) {
-      pendingPoints.push({ x: Date.now(), y: voltage });
-    }
-
-    const peakBadge = document.getElementById('peak');
-    const wsStatus = document.getElementById('wsStatus');
-    const voltageLabel = document.getElementById('voltage');
-    const adcLabel = document.getElementById('adc');
-    const bpmLabel = document.getElementById('bpm');
-
-    function handleMessage(payload) {
-      enqueueVoltage(payload.voltage);
-      voltageLabel.textContent = payload.voltage.toFixed(3) + ' V';
-      adcLabel.textContent = payload.adc;
-      bpmLabel.textContent = payload.bpm > 0 ? payload.bpm.toFixed(1) : '--';
-      if (payload.peak) {
-        peakBadge.classList.add('active');
-        setTimeout(() => peakBadge.classList.remove('active'), 180);
+      // RED-only continuous measurement — stream raw data to app
+      // App handles all BPM computation from corrected RED signal
+      if (processMeasurementCycle(micros(), true)) {
+        // Data is published via processMeasurementCycle
       }
-    }
-
-    const socket = new WebSocket('ws://' + window.location.hostname + ':81/');
-
-    socket.addEventListener('open', () => {
-      wsStatus.textContent = 'Connected';
-      wsStatus.style.color = '#5ee1ab';
-    });
-
-    socket.addEventListener('message', (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        handleMessage(data);
-      } catch (err) {
-        console.warn('Malformed payload', event.data);
-      }
-    });
-
-    socket.addEventListener('close', () => {
-      wsStatus.textContent = 'Disconnected';
-      wsStatus.style.color = '#f64e5b';
-      setTimeout(() => {
-        wsStatus.textContent = 'Reconnecting...';
-      }, 1000);
-    });
-  </script>
-</body>
-</html>
-)rawliteral";
-
-// ---------- State variables ----------
-unsigned long lastSampleMicros = 0;
-unsigned long lastWifiAttemptMs = 0;
-unsigned long wifiConnectStartMs = 0;
-bool redLedState = false;
-uint8_t pendingSampleCount = 0;
-uint32_t adcAccumulator = 0;
-float voltageAccumulator = 0.0f;
-bool pendingPeak = false;
-
-float baselineVoltage = 0.0;
-bool wasAboveThreshold = false;
-unsigned long lastPeakMillis = 0;
-float bpm = 0.0;
-const uint8_t WS_QUEUE_SIZE = 6;
-struct Measurement { uint16_t adc; float voltage; bool peak; };
-Measurement wsQueue[WS_QUEUE_SIZE];
-uint8_t wsQueueStart = 0;
-uint8_t wsQueueCount = 0;
-unsigned long lastWsFlushMs = 0;
-const unsigned long WS_SEND_INTERVAL_MS = 80;
-
-WiFiState wifiState = WiFiState::Idle;
-bool wifiConnectedLogged = false;
-
-// ---------- Forward declarations ----------
-void handleRoot();
-void handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
-bool detectPeak(float voltage);
-void queueMeasurement(uint16_t adc, float voltage, bool peakDetected);
-void attemptSendQueue();
-void ensureWiFiConnected();
-
-void setup() {
-  Serial.begin(115200);
-  delay(100);
-  pinMode(RED_LED_PIN, OUTPUT);
-  pinMode(IR_LED_PIN, OUTPUT);
-  digitalWrite(RED_LED_PIN, LOW);
-  digitalWrite(IR_LED_PIN, LOW);
-
-  esp_timer_create_args_t ledTimerArgs = {
-    .callback = ledToggleCallback,
-    .name = "led-toggle"
-  };
-  esp_timer_create(&ledTimerArgs, &ledTimer);
-  esp_timer_start_periodic(ledTimer, LED_TOGGLE_INTERVAL_MS * 1000);
-
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  ensureWiFiConnected();
-
-  server.on("/", handleRoot);
-  server.begin();
-
-  webSocket.begin();
-  webSocket.onEvent(handleWebSocketEvent);
-  Serial.println("Web server and WebSocket initialized");
-}
-
-enum class WiFiState { Idle, Connecting, Connected };
-WiFiState wifiState = WiFiState::Idle;
-
-esp_timer_handle_t ledTimer;
-
-void ledToggleCallback(void*) {
-  redLedState = !redLedState;
-  digitalWrite(RED_LED_PIN, redLedState ? HIGH : LOW);
-  digitalWrite(IR_LED_PIN, redLedState ? LOW : HIGH);
-}
-
-void loop() {
-  server.handleClient();
-  webSocket.loop();
-  ensureWiFiConnected();
-
-  unsigned long nowMicros = micros();
-  if (nowMicros - lastSampleMicros >= SAMPLE_INTERVAL_US) {
-    lastSampleMicros = nowMicros;
-    uint16_t adcValue = analogRead(PHOTODIODE_PIN);
-    float voltage = (adcValue * 3.3f) / 4095.0f;
-    bool peak = detectPeak(voltage);
-    pendingPeak = pendingPeak || peak;
-    adcAccumulator += adcValue;
-    voltageAccumulator += voltage;
-    pendingSampleCount++;
-    if (pendingSampleCount >= SEND_BATCH_SIZE) {
-      float avgVoltage = voltageAccumulator / pendingSampleCount;
-      uint16_t avgAdc = adcAccumulator / pendingSampleCount;
-      queueMeasurement(avgAdc, avgVoltage, pendingPeak);
-      pendingSampleCount = 0;
-      adcAccumulator = 0;
-      voltageAccumulator = 0.0f;
-      pendingPeak = false;
+      break;
     }
   }
 
-  attemptSendQueue();
-
+  // 5. Periodic debug output
+  printPeriodicDebug(nowMs);
 }
 
-void handleRoot() {
-  server.send_P(200, "text/html", INDEX_HTML);
-}
+}  // namespace hb
 
-void handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
-  if (type == WStype_DISCONNECTED) {
-    Serial.printf("WebSocket [%u] disconnected\n", num);
-  } else if (type == WStype_CONNECTED) {
-    IPAddress ip = webSocket.remoteIP(num);
-    Serial.printf("WebSocket [%u] connected from %u.%u.%u.%u\n", num, ip[0], ip[1], ip[2], ip[3]);
-  }
-}
-
-bool detectPeak(float voltage) {
-  const float smoothing = 0.01f;
-  baselineVoltage = (baselineVoltage * (1.0f - smoothing)) + (voltage * smoothing);
-  const float threshold = baselineVoltage + 0.025f;
-  unsigned long now = millis();
-  bool triggered = false;
-  if (!wasAboveThreshold && voltage > threshold && (now - lastPeakMillis) > 300) {
-    if (lastPeakMillis != 0) {
-      float interval = now - lastPeakMillis;
-      bpm = 60000.0f / interval;
-    }
-    lastPeakMillis = now;
-    triggered = true;
-  }
-  wasAboveThreshold = voltage > threshold;
-  return triggered;
-}
-
-void queueMeasurement(uint16_t adc, float voltage, bool peakDetected) {
-  if (wsQueueCount == WS_QUEUE_SIZE) {
-    wsQueueStart = (wsQueueStart + 1) % WS_QUEUE_SIZE;
-    wsQueueCount--;
-  }
-  uint8_t idx = (wsQueueStart + wsQueueCount) % WS_QUEUE_SIZE;
-  wsQueue[idx] = { adc, voltage, peakDetected };
-  wsQueueCount++;
-  attemptSendQueue();
-}
-
-void attemptSendQueue() {
-  if (!wsQueueCount) {
-    return;
-  }
-  unsigned long now = millis();
-  if (now - lastWsFlushMs < WS_SEND_INTERVAL_MS) {
-    return;
-  }
-  if (!webSocket.connectedClients()) {
-    return;
-  }
-  Measurement m = wsQueue[wsQueueStart];
-  char buffer[128];
-  int len = snprintf(buffer, sizeof(buffer), "{\"adc\":%u,\"voltage\":%.4f,\"bpm\":%.1f,\"peak\":%d}",
-                     m.adc, m.voltage, bpm, m.peak ? 1 : 0);
-  webSocket.broadcastTXT(buffer, len);
-  wsQueueStart = (wsQueueStart + 1) % WS_QUEUE_SIZE;
-  wsQueueCount--;
-  lastWsFlushMs = now;
-}
-
-void ensureWiFiConnected() {
-  unsigned long now = millis();
-  if (WiFi.status() == WL_CONNECTED) {
-    if (wifiState != WiFiState::Connected) {
-      wifiState = WiFiState::Connected;
-      wifiConnectedLogged = false;
-    }
-    if (!wifiConnectedLogged) {
-      wifiConnectedLogged = true;
-      Serial.print("Wi-Fi connected, IP: ");
-      Serial.println(WiFi.localIP());
-    }
-    return;
-  }
-
-  if (wifiState == WiFiState::Idle) {
-    if (now - lastWifiAttemptMs >= WIFI_RECONNECT_INTERVAL_MS) {
-      lastWifiAttemptMs = now;
-      wifiState = WiFiState::Connecting;
-      wifiConnectStartMs = now;
-      wifiConnectedLogged = false;
-      Serial.print("Wi-Fi connecting to ");
-      Serial.println(WIFI_SSID);
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    }
-    return;
-  }
-
-  if (wifiState == WiFiState::Connecting) {
-    if (WiFi.status() == WL_CONNECTED) {
-      wifiState = WiFiState::Connected;
-      wifiConnectedLogged = false;
-      return;
-    }
-    if (now - wifiConnectStartMs >= 8000) {
-      wifiState = WiFiState::Idle;
-      Serial.println("Wi-Fi connect timed out, will retry");
-    }
-  }
-}
+void setup() { hb::appSetup(); }
+void loop() { hb::appLoop(); }
