@@ -15,7 +15,12 @@ class BleTransport {
   void setBaselineValue(float baselineR, bool valid);
   void setBaselineCapturing(bool capturing);
 
-  void publish(const TelemetryPacket& packet, bool cycleComplete, bool force = false);
+  /// Queue a raw sample into the batch buffer.
+  /// Returns true when the batch is full and was sent.
+  bool queueRawSample(const RawBlePacket& sample);
+
+  /// Force-flush any queued samples (even if batch not full).
+  void flushBatch();
 
   bool popCommand(BleCommand& commandOut);
   bool isConnected() const;
@@ -29,6 +34,12 @@ class BleTransport {
   uint32_t lastNotifyMs_ = 0;
   bool baselineValid_ = false;
   bool baselineCapturing_ = false;
+
+  // Batch buffer: up to 5 samples of 11 bytes each = 55 bytes max
+  static constexpr uint8_t kMaxBatch = 5;
+  static constexpr uint8_t kSampleBytes = 11;
+  uint8_t batchBuffer_[kMaxBatch * kSampleBytes] = {};
+  uint8_t batchCount_ = 0;
 };
 
 }  // namespace hb

@@ -14,11 +14,9 @@ This is intentionally detailed and includes both firmware and app layers.
 
 ## Critical scientific boundary
 
-HemePulse uses reflective red/IR optical trends and baseline-relative drift logic.
+HemePulse utilizes reflective red/IR optical trends to estimate Hemoglobin (g/dL) via a custom native Dart decision tree regression model (`HbPredictor`). 
 
-It does not directly output absolute clinical hemoglobin concentration.
-
-Any absolute concentration claim would require controlled calibration against clinical reference datasets, with robust compensation for tissue path, perfusion variability, sensor geometry, and analog front-end behavior.
+While it provides direct concentration output, absolute clinical claims require controlled calibration against clinical reference datasets, with robust compensation for tissue path, perfusion variability, sensor geometry, and analog front-end behavior. The app includes fine-tuning capabilities to adjust these values against actual ground truth testing.
 
 ---
 
@@ -55,8 +53,9 @@ Source: include/app_config.h
 
 ### 3.2 Timing and scheduler constants
 
-- kMeasurementCyclePeriodUs = 20000 (50 Hz)
-- kLedSettleUs = 1500
+- kMeasurementCyclePeriodUs = 40000 (25 Hz full ambient+RED+IR cycle)
+- kLedPulsePeriodUs = 20000 (50 Hz RED-only pulse mode)
+- kLedSettleUs = 4000
 - kDarkGapUs = 1000
 
 ### 3.3 Signal/history framework values
@@ -67,7 +66,7 @@ Source: include/app_config.h
 - kRatioConsistencyWindow = 40
 - kBandpassHpHz = 0.5
 - kBandpassLpHz = 4.0
-- kSampleRateHz = 50.0
+- kSampleRateHz = 25.0
 
 ### 3.4 BPM and peak guardrails
 
@@ -102,28 +101,21 @@ Source: include/app_config.h
 ### 3.7 Baseline capture constants
 
 - kBaselineCaptureDurationMs = 60000
-- kMinBaselineSamples = 200
-- kBaselineCapturePaddingMs = 10000
+- kMinBaselineSamples = 3
 
-### 3.8 Session/sleep/connection constants
+### 3.8 Session and runtime mode constants
 
-- kSessionActiveMs = 25000
-- kNoConnectionSleepMs = 8000
-- kSleepIntervalMs = 20000
-- kManualWakePin = 9
-- kManualActiveWindowMs = 60000
-- kAutoMeasurementWindowMs = 2000
-- kBleAdvertisingWindowMs = 12000
-- kConnectedSessionWindowMs = 15000
-- kEnableDeepSleep = true
-- kMinSessionSamples = 30
+- kHbIntervalMs = 20000
+- kHbBurstMs = 2500
+- kIdleLoopDelayMs = 10
+- kMinSessionSamples = 3
 
 ### 3.9 BLE and debug constants
 
 - kBleNotifyIntervalMs = 20
 - kBleDeviceName = "HemePulse-C3"
-- kEnableSerialDebug = false
-- kEnableSerialWaveform = true
+- kEnableSerialDebug = true
+- kEnableSerialWaveform = false
 - kWaveformPrintIntervalMs = 20
 
 ---
@@ -262,27 +254,27 @@ Source: hb_monitor_app/lib/state/app_state.dart
 
 ### 5.1 App BPM estimation pipeline
 
-The app estimates BPM using IR tail analysis:
+The app estimates BPM from corrected RED signal valley timing:
 
-1. Use up to last 300 IR samples.
+1. Use up to the last 300 corrected RED samples.
 2. Detrend each point by subtracting local 5-point moving average:
 
 \[
-filtered_i = ir_i - \frac{ir_{i-2}+ir_{i-1}+ir_i+ir_{i+1}+ir_{i+2}}{5}
+filtered_i = red_i - \frac{red_{i-2}+red_{i-1}+red_i+red_{i+1}+red_{i+2}}{5}
 \]
 
 3. Compute mean and standard deviation of filtered sequence.
-4. Dynamic threshold:
+4. Dynamic valley threshold:
 
 \[
-threshold = mean + \max(2.0, 0.45 \times stddev)
+threshold = mean - \max(1.5, 0.4 \times stddev)
 \]
 
-5. Peak condition at index i:
+5. Valley condition at index i:
 
-- filtered[i] > filtered[i-1]
-- filtered[i] >= filtered[i+1]
-- filtered[i] > threshold
+- filtered[i] < filtered[i-1]
+- filtered[i] <= filtered[i+1]
+- filtered[i] < threshold
 
 6. Peak spacing gate: at least 320 ms between accepted peaks.
 7. Interval filter: keep intervals in [300, 1500] ms.
@@ -296,25 +288,15 @@ BPM = round\left(\frac{60000}{avgIntervalMs}\right)
 
 ### 5.2 App motion-likelihood formula
 
-Using recent ~20 samples:
+Using recent ~20 samples from active signal series (RED in pulse mode):
 
 \[
-irNorm = \frac{mean(|\Delta ir|)}{\max(5, mean(|ir|))}
-\]
-
-\[
-redNorm = \frac{mean(|\Delta red|)}{\max(5, mean(|red|))}
-\]
-
-\[
-ratioNorm = mean(|\Delta ratio|)
+norm = \frac{mean(|\Delta s|)}{\max(5, mean(|s|))}
 \]
 
 Motion likely when:
 
-- irNorm > 0.22 OR
-- redNorm > 0.22 OR
-- ratioNorm > 0.07
+- norm > 0.22
 
 ### 5.3 App confidence refinement
 
@@ -348,6 +330,20 @@ Inspects last 4 sessions:
 - include only sessions with confidence >= 55 and not motionLikely
 - count sessions with drift >= 0.07
 - repeatedSessionDrift = true when count >= 3
+
+### 5.6 App Hemoglobin Prediction Formula
+
+The app calculates absolute Hemoglobin (g/dL) natively using a decision tree ensemble `HbPredictor`.
+
+1. **Calculate the Red/IR ratio from medians:**
+   `ourR = median(cleanRedSamples) / median(cleanIrSamples)`
+2. **Transform to Natural Logarithm (`ln`):**
+   `lnRatio = math.log(ourR)`
+3. **Execute Prediction Model:**
+   The `HbPredictor.predict(lnRatio, genderInt, age)` function is executed where:
+   - `genderInt` = 1 for Male, 0 for Female.
+   - `age` = numeric age of user.
+   - If the model execution fails, a simple heuristic fallback is used: `finalHb = 13.0 - (ourR - 0.5) * 5.0`.
 
 ---
 

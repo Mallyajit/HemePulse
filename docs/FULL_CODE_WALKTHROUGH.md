@@ -9,7 +9,17 @@ Current firmware runtime has been migrated to always-awake mode:
 - sleep-test PlatformIO environment (`lolin_c3_mini_sleep_test`) is removed,
 - periodic measurement cadence is now `kReadingIntervalMs = 20000`.
 
+Authoritative runtime truth for current code:
+
+- active telemetry path is compact packet UUID `...1009` (+ control `...1007`, baseline `...1008`),
+- pulse-check mode is RED-only (`GPIO1`) and continues until explicit stop/disconnect,
+- app-side BPM is computed from corrected RED valleys, not IR peaks,
+- exact constants must be taken from `include/app_config.h` and `hb_monitor_app/lib/state/app_state.dart`.
+
 Any legacy deep-sleep state-machine sections below are historical reference only.
+
+> [!TIP]
+> **New to the project?** Read the [Beginner's Data Pipeline Guide](./BEGINNERS_DATA_PIPELINE_GUIDE.md) first to understand how data flows from the ESP32 to the Flutter app, how BPM is extracted, and how you can tune the Hemoglobin equations!
 
 ## 1. Purpose and Reading Strategy
 
@@ -30,9 +40,9 @@ This walkthrough explains:
 
 ### Scientific Scope Boundary (Critical)
 
-HemePulse does **not** claim direct absolute hemoglobin concentration from simple dual-LED PPG alone.
+HemePulse utilizes reflective red/IR optical trends to estimate Hemoglobin (g/dL) via a custom native Dart decision tree regression model (`HbPredictor`). 
 
-The code implements **relative optical trend estimation** and **risk drift logic** based on red/IR behavior over time, confidence checks, and baseline comparison.
+While it provides direct concentration output, absolute clinical claims require controlled calibration against clinical reference datasets. The app includes fine-tuning capabilities to adjust these values against actual ground truth testing.
 
 Use this system as a prototype signal intelligence and trend warning tool, not as a clinical diagnostic replacement.
 

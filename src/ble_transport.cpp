@@ -16,19 +16,6 @@ const char* kControlUuid = "4f9c0107-a1f2-4c31-98cb-1cce5caa1007";
 const char* kBaselineUuid = "4f9c0108-a1f2-4c31-98cb-1cce5caa1008";
 const char* kPacketUuid = "4f9c0109-a1f2-4c31-98cb-1cce5caa1009";
 
-constexpr size_t kCompactPacketPayloadSize =
-  sizeof(uint32_t) +  // timestampMs
-  sizeof(int16_t) +   // ambientRaw
-  sizeof(int16_t) +   // redCorrected
-  sizeof(int16_t) +   // irCorrected
-  sizeof(float) +     // ratioR
-  sizeof(uint8_t) +   // confidence
-  sizeof(uint8_t) +   // warning
-  sizeof(uint8_t);    // flags
-
-static_assert(kCompactPacketPayloadSize == 17,
-        "Compact BLE packet contract changed unexpectedly");
-
 NimBLEServer* gServer = nullptr;
 NimBLECharacteristic* gControlChar = nullptr;
 NimBLECharacteristic* gBaselineChar = nullptr;
@@ -84,7 +71,7 @@ void BleTransport::begin(const char* deviceName) {
 
   NimBLEService* service = gServer->createService(kServiceUuid);
 
-    gPacketChar = service->createCharacteristic(
+  gPacketChar = service->createCharacteristic(
       kPacketUuid, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
   gControlChar = service->createCharacteristic(
@@ -96,8 +83,9 @@ void BleTransport::begin(const char* deviceName) {
       kBaselineUuid,
       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY);
 
-  uint8_t emptyPacket[kCompactPacketPayloadSize] = {0};
-  gPacketChar->setValue(emptyPacket, sizeof(emptyPacket));
+  // Initialize with empty values
+  uint8_t emptyPacket[kMaxBatch * kSampleBytes] = {0};
+  gPacketChar->setValue(emptyPacket, kSampleBytes);  // single empty sample
   gControlChar->setValue("READY");
 
   setBaselineValue(0.0f, false);
@@ -112,6 +100,7 @@ void BleTransport::begin(const char* deviceName) {
   hasPendingCommand_ = false;
   pendingCommand_ = BleCommand();
   lastNotifyMs_ = 0;
+  batchCount_ = 0;
 }
 
 void BleTransport::update(uint32_t nowMs) {
@@ -140,6 +129,7 @@ void BleTransport::shutdown() {
   gBaselineChar = nullptr;
   hasPendingCommand_ = false;
   pendingCommand_ = BleCommand();
+  batchCount_ = 0;
 }
 
 void BleTransport::setBaselineValue(float baselineR, bool valid) {
@@ -161,59 +151,50 @@ void BleTransport::setBaselineValue(float baselineR, bool valid) {
 
 void BleTransport::setBaselineCapturing(bool capturing) { baselineCapturing_ = capturing; }
 
-void BleTransport::publish(const TelemetryPacket& packet, bool cycleComplete, bool force) {
-  if (!cycleComplete && !force) {
+bool BleTransport::queueRawSample(const RawBlePacket& sample) {
+  if (!gConnected || gPacketChar == nullptr) {
+    batchCount_ = 0;
+    return false;
+  }
+
+  // Serialize sample into batch buffer
+  const size_t offset = static_cast<size_t>(batchCount_) * kSampleBytes;
+  memcpy(batchBuffer_ + offset, &sample.timestampMs, sizeof(uint32_t));
+  memcpy(batchBuffer_ + offset + 4, &sample.ambientRaw, sizeof(int16_t));
+  memcpy(batchBuffer_ + offset + 6, &sample.redCorrected, sizeof(int16_t));
+  memcpy(batchBuffer_ + offset + 8, &sample.irCorrected, sizeof(int16_t));
+  batchBuffer_[offset + 10] = sample.mode;
+
+  ++batchCount_;
+
+  // If batch full, send it
+  if (batchCount_ >= kMaxBatch) {
+    const uint32_t nowMs = millis();
+    if ((nowMs - lastNotifyMs_) >= config::kBleNotifyIntervalMs) {
+      gPacketChar->setValue(batchBuffer_, static_cast<size_t>(batchCount_) * kSampleBytes);
+      gPacketChar->notify();
+      lastNotifyMs_ = nowMs;
+      batchCount_ = 0;
+      return true;
+    }
+    // If rate-limited, drop oldest and shift
+    memmove(batchBuffer_, batchBuffer_ + kSampleBytes,
+            static_cast<size_t>(kMaxBatch - 1) * kSampleBytes);
+    batchCount_ = kMaxBatch - 1;
+  }
+
+  return false;
+}
+
+void BleTransport::flushBatch() {
+  if (!gConnected || gPacketChar == nullptr || batchCount_ == 0) {
     return;
   }
 
-  if (!gConnected) {
-    return;
-  }
-
-  if (gPacketChar == nullptr) {
-    return;
-  }
-
-  const uint32_t nowMs = millis();
-  if (!force && ((nowMs - lastNotifyMs_) < config::kBleNotifyIntervalMs)) {
-    return;
-  }
-
-  uint8_t liveFlags = packet.flags;
-  if (baselineValid_) {
-    liveFlags |= 0x10;
-  }
-  if (baselineCapturing_) {
-    liveFlags |= 0x20;
-  }
-
-  uint8_t payload[kCompactPacketPayloadSize] = {0};
-  uint8_t warningRaw = static_cast<uint8_t>(packet.warning);
-
-  size_t offset = 0;
-  memcpy(payload + offset, &packet.timestampMs, sizeof(packet.timestampMs));
-  offset += sizeof(packet.timestampMs);
-
-  memcpy(payload + offset, &packet.ambientRaw, sizeof(packet.ambientRaw));
-  offset += sizeof(packet.ambientRaw);
-
-  memcpy(payload + offset, &packet.redCorrected, sizeof(packet.redCorrected));
-  offset += sizeof(packet.redCorrected);
-
-  memcpy(payload + offset, &packet.irCorrected, sizeof(packet.irCorrected));
-  offset += sizeof(packet.irCorrected);
-
-  memcpy(payload + offset, &packet.ratioR, sizeof(packet.ratioR));
-  offset += sizeof(packet.ratioR);
-
-  payload[offset++] = packet.confidence;
-  payload[offset++] = warningRaw;
-  payload[offset++] = liveFlags;
-
-  gPacketChar->setValue(payload, sizeof(payload));
+  gPacketChar->setValue(batchBuffer_, static_cast<size_t>(batchCount_) * kSampleBytes);
   gPacketChar->notify();
-
-  lastNotifyMs_ = nowMs;
+  lastNotifyMs_ = millis();
+  batchCount_ = 0;
 }
 
 bool BleTransport::popCommand(BleCommand& commandOut) {

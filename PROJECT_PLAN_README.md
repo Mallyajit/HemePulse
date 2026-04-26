@@ -13,7 +13,8 @@ A compact BLE packet characteristic is now used:
 
 Runtime note:
 - sleep-test firmware target has been removed.
-- main firmware stays active and publishes periodic readings every 20 seconds.
+- main firmware stays active and publishes periodic Hb snapshots every 20 seconds.
+- pulse-check mode switches to RED-only sampling and continues until explicit stop/disconnect.
 
 ## 1) Mission and Scientific Scope
 
@@ -31,7 +32,7 @@ Scientific assumptions encoded in current implementation:
   - `red_norm = AC_red / DC_red`
   - `ir_norm = AC_ir / DC_ir`
   - `R = red_norm / ir_norm`
-- IR channel is used for pulse detection and BPM.
+- In pulse-check mode, app-side BPM is computed from corrected RED signal drops.
 - Risk is derived from drift in `R` relative to per-user baseline, not from direct Hb conversion.
 
 ## 2) Hardware Mapping and Runtime Decisions
@@ -42,9 +43,10 @@ Configured hardware mapping:
 - Photodiode + OPA analog output: GPIO 0 (ADC)
 
 Runtime decisions implemented:
-- LED cycle frequency target: 50 Hz (`20 ms` total cycle)
+- Full cycle target: 25 Hz (`40 ms` ambient+RED+IR cycle)
+- RED-only pulse mode target: 50 Hz (`20 ms` cycle)
 - BLE stack: NimBLE-Arduino
-- BLE telemetry notify cadence: 10 Hz (`100 ms` throttle)
+- BLE telemetry notify cadence: 50 Hz (`20 ms` throttle)
 - Baseline workflow: 60-second capture window with confidence threshold
 
 ## 3) Firmware Architecture (PlatformIO)
@@ -68,10 +70,11 @@ Purpose:
 - Includes pin mapping, ADC scaling, cycle timing, window sizes, BPM bounds, confidence thresholds, baseline timing, risk thresholds, BLE cadence.
 
 Key configurable constants:
-- `kMeasurementCyclePeriodUs = 20000` (50 Hz)
-- `kLedSettleUs = 1500`
+- `kMeasurementCyclePeriodUs = 40000` (25 Hz)
+- `kLedPulsePeriodUs = 20000` (50 Hz in RED-only pulse mode)
+- `kLedSettleUs = 4000`
 - `kDarkGapUs = 1000`
-- `kBleNotifyIntervalMs = 100`
+- `kBleNotifyIntervalMs = 20`
 - `kBaselineCaptureDurationMs = 60000`
 - `kMinConfidenceForBaseline = 65`
 
@@ -220,14 +223,9 @@ Purpose:
 
 Service and characteristics:
 - Service: `4f9c0100-a1f2-4c31-98cb-1cce5caa1000`
-- Live status: `...1001`
-- BPM: `...1002`
-- Ratio R: `...1003`
-- Confidence: `...1004`
-- Warning: `...1005`
-- Waveform (IR): `...1006`
 - Control (write): `...1007`
 - Baseline payload: `...1008`
+- Compact packet notify: `...1009` (active runtime telemetry)
 
 Control commands parsed:
 - `SNAP`
@@ -237,6 +235,10 @@ Control commands parsed:
 - `CAL_PD=<float>`
 - `CAL_GAIN=<float>`
 - `CAL_VREF=<float>`
+- `BPM_START`
+- `BPM_STOP`
+- `MODE_PULSE`
+- `MODE_IDLE`
 
 Transport behavior:
 - Notifications are emitted when cycle output is available and notify throttle allows it.

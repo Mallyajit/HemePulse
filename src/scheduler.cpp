@@ -63,7 +63,7 @@ bool MeasurementScheduler::update(uint32_t nowUs, RawCycleSample& sampleOut) {
         return false;
       }
       current_.ambientRaw = hw_->readAdcRaw();
-      hw_->setLedState(true, false);
+      hw_->setLedState(true, false);  // RED ON
       state_ = SchedulerState::kRedSettle;
       stateStartUs_ = nowUs;
       return false;
@@ -73,7 +73,7 @@ bool MeasurementScheduler::update(uint32_t nowUs, RawCycleSample& sampleOut) {
         return false;
       }
       current_.redRaw = hw_->readAdcRaw();
-      hw_->setLedState(false, false);
+      hw_->setLedState(false, false);  // All OFF
 
       if (redOnly_) {
         // RED-only mode: skip IR, compute corrected RED and finish cycle
@@ -96,7 +96,7 @@ bool MeasurementScheduler::update(uint32_t nowUs, RawCycleSample& sampleOut) {
       if (!elapsedUs(nowUs, stateStartUs_, config::kDarkGapUs)) {
         return false;
       }
-      hw_->setLedState(false, true);
+      hw_->setLedState(false, true);  // IR ON
       state_ = SchedulerState::kIrSettle;
       stateStartUs_ = nowUs;
       return false;
@@ -106,7 +106,7 @@ bool MeasurementScheduler::update(uint32_t nowUs, RawCycleSample& sampleOut) {
         return false;
       }
       current_.irRaw = hw_->readAdcRaw();
-      hw_->setLedState(false, false);
+      hw_->setLedState(false, false);  // All OFF
 
       current_.redCorrected = correctSample(current_.redRaw, current_.ambientRaw);
       current_.irCorrected = correctSample(current_.irRaw, current_.ambientRaw);
@@ -118,11 +118,15 @@ bool MeasurementScheduler::update(uint32_t nowUs, RawCycleSample& sampleOut) {
       stateStartUs_ = nowUs;
       return true;
 
-    case SchedulerState::kWaitNextCycle:
-      if (elapsedUs(nowUs, cycleStartUs_, config::kMeasurementCyclePeriodUs)) {
+    case SchedulerState::kWaitNextCycle: {
+      const uint32_t cyclePeriodUs = redOnly_
+                                         ? config::kPulseCyclePeriodUs
+                                         : config::kMeasurementCyclePeriodUs;
+      if (elapsedUs(nowUs, cycleStartUs_, cyclePeriodUs)) {
         startNewCycle(nowUs);
       }
       return false;
+    }
 
     default:
       state_ = SchedulerState::kInit;

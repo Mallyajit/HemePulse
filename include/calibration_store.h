@@ -19,19 +19,12 @@ class CalibrationStore {
   void setUserBaseline(float valueR, bool valid);
   void clearUserBaseline();
 
-  void setSessionCounters(uint16_t stableCount, uint16_t suspiciousCount,
-                          uint16_t badSignalCount);
-  void saveLastSessionSummary(const SessionSummary& summary);
-  bool loadLastSessionSummary(SessionSummary& summaryOut) const;
-
  private:
   void loadDefaults();
   void loadFromStorage();
   void saveToStorage();
-  void saveSessionSummaryToStorage() const;
 
   CalibrationProfile profile_;
-  SessionSummary lastSession_;
 };
 
 }  // namespace hb

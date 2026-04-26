@@ -23,9 +23,10 @@ The board now runs in an always-awake mode:
 
 ## Measurement Cadence
 
-Readings are generated every 20 seconds using:
+The runtime uses two modes:
 
-- `kReadingIntervalMs = 20000`
+- Hb monitoring mode (default idle path): one snapshot burst every `kHbIntervalMs = 20000`.
+- Pulse mode (manual BPM check): RED-only continuous sampling until stop/disconnect.
 
 Within each reading event, the existing acquisition pipeline is used:
 
@@ -33,6 +34,12 @@ Within each reading event, the existing acquisition pipeline is used:
 - lightweight preprocessing (ambient correction + EMA)
 - local baseline comparison and warning logic
 - compact BLE packet publish
+
+In pulse mode:
+
+- RED LED pin is `GPIO1` (`kRedLedPin`).
+- IR LED is intentionally disabled.
+- scheduler uses RED-only cycles for live BPM estimation in app.
 
 ## Baseline Capture in 20s Cadence Mode
 
@@ -45,12 +52,12 @@ This allows baseline capture to complete in always-awake low-rate mode.
 
 ## Serial Output
 
-Waveform/debug preview output remains enabled for demos:
+Default serial configuration:
 
-- `kEnableSerialWaveform = true`
-- Output format per sample: `>sin:<filtered_ir_value>`
+- `kEnableSerialDebug = true`
+- `kEnableSerialWaveform = false`
 
-This is serial plotter friendly and intended for presentation.
+You can re-enable waveform output for manual tuning if needed.
 
 ## Build and Upload
 
