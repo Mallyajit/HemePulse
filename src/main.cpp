@@ -126,8 +126,8 @@ void updateBaselineCapture(const RawCycleSample& sample, uint32_t nowMs) {
 
 void enterPulseMode() {
   gMode = OpMode::kPulse;
-  gScheduler.beginRedOnly(gHardware, micros());
-  if (config::kEnableSerialDebug) Serial.println("[MODE] PULSE (RED-only 20Hz)");
+  gScheduler.begin(gHardware, micros());
+  if (config::kEnableSerialDebug) Serial.println("[MODE] PULSE (RED & IR 20Hz)");
 }
 
 void enterIdleMode() {
@@ -322,14 +322,14 @@ void appLoop() {
     }
 
     case OpMode::kPulse: {
-      // RED-only 20Hz streaming — all processing on phone
+      // RED & IR 20Hz streaming — all processing on phone
       RawCycleSample sample;
       if (gScheduler.update(micros(), sample)) {
         RawBlePacket pkt;
         pkt.timestampMs = sample.timestampMs;
         pkt.ambientRaw = sample.ambientRaw;
         pkt.redCorrected = quantizeSignal(sample.redCorrected);
-        pkt.irCorrected = 0;  // IR is off in pulse mode
+        pkt.irCorrected = quantizeSignal(sample.irCorrected);
         pkt.mode = modeToU8(gMode);
         gBleTransport.queueRawSample(pkt);
       }
